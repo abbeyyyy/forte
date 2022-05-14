@@ -41,6 +41,7 @@ class NewType(Generics):
 class DummyModel:
     def __call__(self, batch):
         text_feature = batch["text_tag"]["data"]
+        print(text_feature)
         return {
             "ner_tag": [
                 [FAKEOUTPUT for j in range(len(text_feature[0]))]

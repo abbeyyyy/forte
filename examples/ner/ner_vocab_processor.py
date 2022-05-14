@@ -74,6 +74,7 @@ class CoNLL03VocabularyProcessor(VocabularyProcessor):
 
     # pylint: disable=unused-argument
     def initialize(self, resources: Resources, configs: Config):
+        print(configs)
         self.min_frequency = configs.min_frequency
         self.normalize_digit = configs.normalize_digit
         self.embedding_path = configs.embedding_path

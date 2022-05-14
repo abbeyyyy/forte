@@ -60,17 +60,6 @@ class CoNLLNERTrainer(BaseTrainer):
         """Create an NER trainer."""
 
         super().__init__()
-
-        self.model = None
-
-        self.word_alphabet = None
-        self.char_alphabet = None
-        self.ner_alphabet = None
-
-        self.config_model = None
-        self.config_data = None
-        self.normalize_func = None
-
         self.device = None
         self.optim, self.trained_epochs = None, None
 
@@ -82,6 +71,17 @@ class CoNLLNERTrainer(BaseTrainer):
         self.max_char_length = 0
 
         self.__past_dev_result = None
+        self.model = None
+
+        self.word_alphabet = None
+        self.char_alphabet = None
+        self.ner_alphabet = None
+
+        self.config_model = None
+        self.config_data = None
+        self.normalize_func = None
+
+
 
     def initialize(self, resources: Resources, configs: Config):
         """
