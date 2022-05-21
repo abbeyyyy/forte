@@ -30,17 +30,19 @@ import numpy as np
 import torch.nn.functional as F
 from transformers import BertTokenizer, BertConfig, BertModel, \
     BertForTokenClassification
+from pytorch_transformers import WarmupLinearSchedule
 
 from forte.data.base_pack import PackType
 from forte.data.data_pack import DataPack
 from forte.data.data_pack_weight_sampler import DataPackWeightSampler
 from forte.pipeline import Pipeline
-from forte.data.mix_up_dataset import MixupIterator, mix_embeddings
+from forte.data.mix_up_dataset import MixupIterator
 from forte.data.readers.conll03_reader import CoNLL03Reader
 from ft.onto.base_ontology import Sentence, EntityMention, Token
 
 logger = logging.getLogger(__name__)
 BERT_MODEL = "bert-base-cased"
+TASK_NAME = "ner"
 
 
 class BertModelForNer(BertModel):
@@ -57,22 +59,22 @@ class BertModelForNer(BertModel):
                                 head_mask=head_mask_a,
                                 position_ids=position_ids_a,
                                 )
-        embedding_output_b, extended_attention_mask_b, head_mask_b = \
-            self._get_embedding(input_ids_b,
-                                token_type_ids=token_type_ids_b,
-                                attention_mask=attention_mask_b,
-                                head_mask=head_mask_b,
-                                position_ids=position_ids_b,
-                                )
-        # mix embeddings
-        mixed_embedding = mix_embeddings(embedding_output_a, embedding_output_b,
-                                         mix_ratios, mix_idxes)
-        mixed_extended_attention_mask = mix_embeddings(
-            extended_attention_mask_a,
-            extended_attention_mask_b,
-            mix_ratios, mix_idxes)
-        mixed_head_mask = mix_embeddings(head_mask_a, head_mask_b,
-                                         mix_ratios, mix_idxes)
+        if input_ids_b:
+            embedding_output_b, extended_attention_mask_b, head_mask_b = \
+                self._get_embedding(input_ids_b,
+                                    token_type_ids=token_type_ids_b,
+                                    attention_mask=attention_mask_b,
+                                    head_mask=head_mask_b,
+                                    position_ids=position_ids_b,
+                                    )
+            # mix embeddings
+            mixed_embedding = MixupIterator.mix_embeddings(embedding_output_a,
+                                                           embedding_output_b,
+                                                           mix_ratios, mix_idxes)
+        else:
+            mixed_embedding = embedding_output_a
+        mixed_extended_attention_mask = extended_attention_mask_a
+        mixed_head_mask = head_mask_a
 
         encoder_outputs = self.encoder(mixed_embedding,
                                        mixed_extended_attention_mask,
@@ -187,57 +189,37 @@ def softXEnt(input, target):
     return -(target * logprobs).sum() / input.shape[0]
 
 
-# USE BERT FOR EXAMPLES
-# Match with huggingface NER tutorial
-class Embeddings(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.word_embeddings = nn.Embedding(
-            config.vocab_size,
-            config.hidden_size,
-            padding_idx=config.pad_token_id,
-        )
-
-    def forward(self, input_ids_a=None, input_ids_b=None,
-                mix_idxes=None, mix_ratios=None):
-        embedding_output_a = self.embeddings(input_ids_a)
-        embedding_output_b = self.embeddings(input_ids_b)
-        return mix_embeddings(embedding_output_a, embedding_output_b,
-                              mix_ratios, mix_idxes)
-
-
-class Model(nn.Module):
-    def __init__(
-            self,
-            config,
-    ):
-        super().__init__()
-        self.embeddings = Embeddings(config)
-
-    def forward(self, input_ids_a=None, input_ids_b=None, labels=None,
-                masks_a=None, masks_b=None, token_type_ids_a=None,
-                mix_idxes=None, mix_ratios=None):
-        embeddings = self.embeddings(input_ids_a, input_ids_b,
-                                     mix_idxes, mix_ratios)
-        print(embeddings.shape)
-        # add loss
-
-
-class NerTokenizer():
-    def __init__(self, word_alphabet):
-        self.word_alphabet = word_alphabet
-
-    def tokenize(self, text):
-        word_ids = []
-        for word in text.split(' '):
-            word_ids.append(self.word_alphabet.get_index(word))
-        return word_ids
-
-
 class MixupTrainer():
-    def __init__(self):
-        # self.model = Model()
+    def __init__(self, config):
+        self._update_config(config)
         self.get_data_iterator()
+        self.get_model()
+        self.device = torch.device(
+            'cuda' if torch.cuda.is_available() and self.device == 'cuda'
+            else 'cpu')
+        print('DEVICE: ', self.device)
+
+    def _update_config(self, config):
+        self.config = self._default_config()
+        for k, v in config.items():
+            if k in self.config and v != self.config[k]:
+                self.config[k] = v
+
+    @classmethod
+    def _default_config(cls):
+        return {
+            "train_batch_size": 32,
+            "eval_batch_size": 16,
+            "learning_rate": 5e-05,
+            "num_pretrain_epochs": 5,
+            "num_train_epochs": 20,
+            "gradient_accumulation_steps": 1,
+            "weight_decay": 0.01,
+            "warmup_proportion": 1,
+            "adam_epsilon": 1e-08,
+            "max_grad_norm": 1e-08,
+            "device": 'cuda',
+        }
 
     def get_data_iterator(self):
         root_path = os.path.abspath(
@@ -248,53 +230,152 @@ class MixupTrainer():
             )
         )
 
-        file_path: str = os.path.join(
-            root_path, "data_samples/conll03"
+        train_file_path: str = os.path.join(
+            root_path, "data_samples/conll03/train"
+        )
+        eval_file_path: str = os.path.join(
+            root_path, "data_samples/conll03/eval"
+        )
+        test_file_path: str = os.path.join(
+            root_path, "data_samples/conll03/test"
         )
         reader = CoNLL03Reader()
         context_type = Sentence
         request = {
             Token: {"fields": ["ner"]},
-            }
+        }
         skip_k = 0
 
         self.feature_schemes = {}
 
-        train_pl: Pipeline = Pipeline()
-        train_pl.set_reader(reader)
-        train_pl.initialize()
-        self.pack_iterator: Iterator[PackType] = train_pl.process_dataset(
-            file_path)
-
-        self.data_sampler: DataPackWeightSampler = DataPackWeightSampler(
-            self.pack_iterator, data_pack_entity_weighting, context_type,
-            request, skip_k
-        )
-
         self.mixup_iterator = MixupIterator(
-            self.pack_iterator,
+            self.get_iterator(reader, train_file_path),
             data_pack_entity_weighting,
             data_pack_random_entity,
             {"context_type": context_type,
              # "request": request,
              "skip_k": skip_k},
+            self.get_iterator(reader, train_file_path),
+            eval_iterator=self.get_iterator(reader, eval_file_path),
+            test_iterator=self.get_iterator(reader, test_file_path)
         )
+        self.eval_iterator = self.get_iterator(reader, eval_file_path)
 
-    def train(self):
-        tokenizer = BertTokenizer.from_pretrained(BERT_MODEL)
-        labels = ["O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "[CLS]", "[SEP]"]
-        label_map = {l: i for i, l in enumerate(labels)}
-        for batch_data in self.mixup_iterator.get_data_batch(self.mixup_iterator, tokenizer,
-                                        beta_mix_ratio, label_map, 2):
-            print(batch_data)
-        #     words_a, words_b, masks_a, masks_b, mix_ratios, mix_idxes = batch_data
-            # loss = model(...)
+    def get_iterator(self, reader, file_path):
+        pl: Pipeline = Pipeline()
+        pl.set_reader(reader)
+        pl.initialize()
+        return pl.process_dataset(file_path)
 
+    def get_model(self):
+        labels = ["O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG", "I-ORG",
+                  "B-LOC", "I-LOC", "[CLS]", "[SEP]"]
+        self.label_map = {l: i + 1 for i, l in enumerate(labels)}
+        bert_config = BertConfig.from_pretrained(BERT_MODEL,
+                                                 num_labels=len(labels),
+                                                 finetuning_task=TASK_NAME)
+        self.model = BertForNer.from_pretrained(BERT_MODEL, config=bert_config)
+        self.model.bert = BertModelForNer.from_pretrained(
+            BERT_MODEL, config=bert_config
+        )
+        self.tokenizer = BertTokenizer.from_pretrained(BERT_MODEL)
+
+        param_optimizer = list(self.model.named_parameters())
+        no_decay = ['bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {'params': [p for n, p in param_optimizer if
+                        not any(nd in n for nd in no_decay)],
+             'weight_decay': self.config["weight_decay"]},
+            {'params': [p for n, p in param_optimizer if
+                        any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        ]
+
+        num_train_optimization_steps = int(
+            200 / self.config["train_batch_size"] / self.config["gradient_accumulation_steps"]) * (
+                                           (self.config["num_train_epochs"] + self.config["num_pretrain_epochs"]))
+        warmup_steps = int(
+            self.config["warmup_proportion"] * num_train_optimization_steps)
+        # self.optimizer = AdamW(optimizer_grouped_parameters, lr=self.config["learning_rate"],
+        #                   eps=self.config["adam_epsilon"])
+        # self.scheduler = WarmupLinearSchedule(self.optimizer, warmup_steps=warmup_steps,
+        #                                  t_total=num_train_optimization_steps)
+
+    def _update_loss(self, loss):
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                       self.config["max_grad_norm"])
+        # cur_loss += loss
+        self.optimizer.step()
+        self.scheduler.step()  # Update learning rate schedule
+        self.model.zero_grad()
+
+    def train(self, pretrain=False):
+        self.model.to(self.device)
+        self.model.bert.to(self.device)
+        for batch_data in self.mixup_iterator.get_original_data_batch(
+                self.tokenizer, self.label_map, self.config["train_batch_size"]):
+            batch_data = tuple(d.to(self.device) for d in batch_data)
+            # print("b", batch_data)
+            input_ids, valid, labels = batch_data
+            loss = self.model(input_ids_a=input_ids,
+                              attention_mask_a=valid,
+                              labels=labels)
+            self._update_loss(loss)
+
+        if not pretrain:
+            for batch_data in self.mixup_iterator.get_mixed_data_batch(
+                    self.tokenizer, beta_mix_ratio, self.label_map, self.config["train_batch_size"]):
+                # print("b", batch_data)
+                batch_data = tuple(d.to(self.device) for d in batch_data)
+                input_ids_a, input_ids_b, valid_a, valid_b, mix_ratio, labels, mixed_idxes = batch_data
+                loss = self.model(input_ids_a=input_ids_a,
+                                  attention_mask_a=valid_a,
+                                  input_ids_b=input_ids_b,
+                                  attention_mask_b=valid_b,
+                                  mix_idxes=mixed_idxes, mix_ratios=mix_ratio,
+                                  labels=labels)
+                self._update_loss(loss)
+
+    def evaluate(self):
+        y_true = []
+        y_pred = []
+        for batch_data in self.mixup_iterator.get_original_data_batch(
+                self.tokenizer, beta_mix_ratio, self.label_map, self.config["train_batch_size"], mode='EVAL'):
+            input_ids, valid, labels = batch_data
+            with torch.no_grad():
+                logits = self.model(input_ids_a=input_ids,
+                                  attention_mask_a=valid)
+            logits = torch.argmax(F.log_softmax(logits, dim=2), dim=2)
+            logits = logits.detach().cpu().numpy()
+            labels = labels.to('cpu').numpy()
+
+            for i, label in enumerate(labels):
+                temp_1 = []
+                temp_2 = []
+                for j, m in enumerate(label):
+                    if j == 0:
+                        continue
+                    elif labels[i][j][-2] == 1.:
+                        y_true.append(temp_1)
+                        y_pred.append(temp_2)
+                        break
+                    else:
+                        temp_1.append(self.label_map[self._get_label_ids(labels[i][j])])
+                        try:
+                            temp_2.append(self.label_map[logits[i][j]])
+                        except:
+                            temp_2.append('UKN')
+    @classmethod
+    def _get_label_ids(cls, label):
+        for i, l in enumerate(label):
+            if l == 1:
+                return i
+        return -1
 
 # Abstract class with weighting / random entity
 # DEFAULT WEIGHTING SCHEMES
 # Assign weights based on number of entities contained in a sentence
-def data_pack_entity_weighting(pack:DataPack, sentence: Sentence) -> float:
+def data_pack_entity_weighting(pack: DataPack, sentence: Sentence) -> float:
     entity_num = 0.
     for _ in pack.get(EntityMention, sentence):
         entity_num += 1
@@ -302,7 +383,8 @@ def data_pack_entity_weighting(pack:DataPack, sentence: Sentence) -> float:
 
 
 # return a random entity id in a datapack
-def data_pack_random_entity(pack: DataPack, sentence: Sentence, num_entity: int) -> int:
+def data_pack_random_entity(pack: DataPack, sentence: Sentence,
+                            num_entity: int) -> int:
     rand_idx = random.randint(0, num_entity - 1)
     for idx, entity in enumerate(pack.get(EntityMention, sentence)):
         if rand_idx == idx:
@@ -314,7 +396,9 @@ def beta_mix_ratio(alpha):
 
 
 def train():
-    trainer = MixupTrainer()
+    trainer = MixupTrainer({
+
+    })
     trainer.train()
 
 

@@ -67,15 +67,11 @@ class DataPackWeightSampler():
         self._data_pack_iter: Iterator[DataPack] = pack_iterator
         self.data_pack_weighting_fn: Callable[[DataPack, Sentence], float] = data_pack_weighting_fn
         self._curr_data_pack: Optional[DataPack] = None
-        self._instance_iter: Optional[Iterator[Dict[str, Any]]] = None
         self._context_iter: Optional[Iterator[Sentence]] = None
         self._priority_queue: Optional[list] = None
 
     def generate_weighted_samples(self, reservoir_size: int):
         self._curr_data_pack = next(self._data_pack_iter)
-        print(self._get_data_args)
-        self._instance_iter = self._curr_data_pack.get_data(
-            **self._get_data_args)
         self._context_iter = self._curr_data_pack.get(
             Sentence
         )
@@ -90,8 +86,6 @@ class DataPackWeightSampler():
                     self._curr_data_pack = next(self._data_pack_iter)
                 except StopIteration:
                     break
-                self._instance_iter = self._curr_data_pack.get_data(
-                    **self._get_data_args)
                 self._context_iter = self._curr_data_pack.get(
                     Sentence
                 )
