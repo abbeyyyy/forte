@@ -29,14 +29,13 @@ from collections import Counter
 import numpy as np
 import torch.nn.functional as F
 from transformers import BertTokenizer, BertConfig, BertModel, \
-    BertForTokenClassification
+    BertForTokenClassification, AdamW
 from pytorch_transformers import WarmupLinearSchedule
+from seqeval.metrics import classification_report
 
-from forte.data.base_pack import PackType
 from forte.data.data_pack import DataPack
-from forte.data.data_pack_weight_sampler import DataPackWeightSampler
 from forte.pipeline import Pipeline
-from forte.data.mix_up_dataset import MixupIterator
+from forte.data.mix_up_dataset import MixUpIterator, MixupDataProcessor
 from forte.data.readers.conll03_reader import CoNLL03Reader
 from ft.onto.base_ontology import Sentence, EntityMention, Token
 
@@ -59,7 +58,7 @@ class BertModelForNer(BertModel):
                                 head_mask=head_mask_a,
                                 position_ids=position_ids_a,
                                 )
-        if input_ids_b:
+        if input_ids_b is not None:
             embedding_output_b, extended_attention_mask_b, head_mask_b = \
                 self._get_embedding(input_ids_b,
                                     token_type_ids=token_type_ids_b,
@@ -68,9 +67,11 @@ class BertModelForNer(BertModel):
                                     position_ids=position_ids_b,
                                     )
             # mix embeddings
-            mixed_embedding = MixupIterator.mix_embeddings(embedding_output_a,
-                                                           embedding_output_b,
-                                                           mix_ratios, mix_idxes)
+            mixed_embedding = MixupDataProcessor.mix_embeddings(
+                embedding_output_a,
+                embedding_output_b,
+                mix_ratios,
+                mix_idxes)
         else:
             mixed_embedding = embedding_output_a
         mixed_extended_attention_mask = extended_attention_mask_a
@@ -189,13 +190,21 @@ def softXEnt(input, target):
     return -(target * logprobs).sum() / input.shape[0]
 
 
+def one_hot_label(label, label_len):
+    ohe = [0] * label_len
+    ohe[label] = 1.0
+    return np.array(ohe)
+
+
 class MixupTrainer():
     def __init__(self, config):
         self._update_config(config)
         self.get_data_iterator()
         self.get_model()
+        self.data_processor = MixupDataProcessor()
         self.device = torch.device(
-            'cuda' if torch.cuda.is_available() and self.device == 'cuda'
+            'cuda' if torch.cuda.is_available() and self.config[
+                "device"] == 'cuda'
             else 'cpu')
         print('DEVICE: ', self.device)
 
@@ -211,6 +220,7 @@ class MixupTrainer():
             "train_batch_size": 32,
             "eval_batch_size": 16,
             "learning_rate": 5e-05,
+            "max_len": 128,
             "num_pretrain_epochs": 5,
             "num_train_epochs": 20,
             "gradient_accumulation_steps": 1,
@@ -225,8 +235,8 @@ class MixupTrainer():
         root_path = os.path.abspath(
             os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
-                os.pardir,
-                os.pardir,
+                # os.pardir,
+                # os.pardir,
             )
         )
 
@@ -248,29 +258,34 @@ class MixupTrainer():
 
         self.feature_schemes = {}
 
-        self.mixup_iterator = MixupIterator(
+        self.mixup_iterator = MixUpIterator(
             self.get_iterator(reader, train_file_path),
             data_pack_entity_weighting,
             data_pack_random_entity,
             {"context_type": context_type,
              # "request": request,
              "skip_k": skip_k},
-            self.get_iterator(reader, train_file_path),
-            eval_iterator=self.get_iterator(reader, eval_file_path),
-            test_iterator=self.get_iterator(reader, test_file_path)
+            train_iterator=lambda: self.get_iterator(reader, train_file_path),
+            eval_iterator=lambda: self.get_iterator(reader, eval_file_path),
+            test_iterator=lambda: self.get_iterator(reader, test_file_path)
         )
         self.eval_iterator = self.get_iterator(reader, eval_file_path)
 
-    def get_iterator(self, reader, file_path):
+    @classmethod
+    def get_iterator(cls, reader, file_path):
         pl: Pipeline = Pipeline()
         pl.set_reader(reader)
         pl.initialize()
         return pl.process_dataset(file_path)
 
     def get_model(self):
-        labels = ["O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG", "I-ORG",
+        labels = ["[NULL]", "O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG",
+                  "I-ORG",
                   "B-LOC", "I-LOC", "[CLS]", "[SEP]"]
-        self.label_map = {l: i + 1 for i, l in enumerate(labels)}
+        self.label_map = {l: one_hot_label(i, len(labels)) for i, l in
+                          enumerate(labels)}
+        self.label_id_map = {i:l for i, l in
+                          enumerate(labels)}
         bert_config = BertConfig.from_pretrained(BERT_MODEL,
                                                  num_labels=len(labels),
                                                  finetuning_task=TASK_NAME)
@@ -291,14 +306,18 @@ class MixupTrainer():
         ]
 
         num_train_optimization_steps = int(
-            200 / self.config["train_batch_size"] / self.config["gradient_accumulation_steps"]) * (
-                                           (self.config["num_train_epochs"] + self.config["num_pretrain_epochs"]))
+            200 / self.config["train_batch_size"] / self.config[
+                "gradient_accumulation_steps"]) * (
+                                           (self.config["num_train_epochs"] +
+                                            self.config["num_pretrain_epochs"]))
         warmup_steps = int(
             self.config["warmup_proportion"] * num_train_optimization_steps)
-        # self.optimizer = AdamW(optimizer_grouped_parameters, lr=self.config["learning_rate"],
-        #                   eps=self.config["adam_epsilon"])
-        # self.scheduler = WarmupLinearSchedule(self.optimizer, warmup_steps=warmup_steps,
-        #                                  t_total=num_train_optimization_steps)
+        self.optimizer = AdamW(optimizer_grouped_parameters,
+                               lr=self.config["learning_rate"],
+                               eps=self.config["adam_epsilon"])
+        self.scheduler = WarmupLinearSchedule(self.optimizer,
+                                              warmup_steps=warmup_steps,
+                                              t_total=num_train_optimization_steps)
 
     def _update_loss(self, loss):
         loss.backward()
@@ -309,42 +328,68 @@ class MixupTrainer():
         self.scheduler.step()  # Update learning rate schedule
         self.model.zero_grad()
 
-    def train(self, pretrain=False):
+    def train(self):
         self.model.to(self.device)
         self.model.bert.to(self.device)
-        for batch_data in self.mixup_iterator.get_original_data_batch(
-                self.tokenizer, self.label_map, self.config["train_batch_size"]):
+        pretrain_epochs = self.config["num_pretrain_epochs"]
+        train_epochs = self.config["num_train_epochs"]
+        for epoch in range(pretrain_epochs + train_epochs):
+            report = self.evaluate()
+            print(report)
+            self.epoch_train(pretrain=epoch < pretrain_epochs)
+            report = self.evaluate()
+            print(report)
+
+    def epoch_train(self, pretrain=False):
+        for batch_data in self.data_processor.get_original_data_batch(
+                self.mixup_iterator,
+                self.tokenizer, self.label_map,
+                self.config["train_batch_size"],
+                self.config["max_len"],
+        ):
             batch_data = tuple(d.to(self.device) for d in batch_data)
             # print("b", batch_data)
-            input_ids, valid, labels = batch_data
-            loss = self.model(input_ids_a=input_ids,
-                              attention_mask_a=valid,
-                              labels=labels)
+            input_ids, input_mask, valid, labels = batch_data
+            loss, _ = self.model(input_ids_a=input_ids,
+                                 attention_mask_a=input_mask,
+                                 position_ids_a=valid,
+                                 labels=labels)
             self._update_loss(loss)
 
         if not pretrain:
-            for batch_data in self.mixup_iterator.get_mixed_data_batch(
-                    self.tokenizer, beta_mix_ratio, self.label_map, self.config["train_batch_size"]):
+            for batch_data in self.data_processor.get_mixed_data_batch(
+                    self.mixup_iterator,
+                    self.tokenizer, beta_mix_ratio, self.label_map,
+                    self.config["train_batch_size"],
+                    self.config["max_len"],
+            ):
                 # print("b", batch_data)
                 batch_data = tuple(d.to(self.device) for d in batch_data)
-                input_ids_a, input_ids_b, valid_a, valid_b, mix_ratio, labels, mixed_idxes = batch_data
-                loss = self.model(input_ids_a=input_ids_a,
-                                  attention_mask_a=valid_a,
-                                  input_ids_b=input_ids_b,
-                                  attention_mask_b=valid_b,
-                                  mix_idxes=mixed_idxes, mix_ratios=mix_ratio,
-                                  labels=labels)
+                input_ids_a, input_ids_b, input_mask_a, input_mask_b, valid_a, valid_b, mix_ratio, labels, mixed_idxes = batch_data
+                loss, _ = self.model(input_ids_a=input_ids_a,
+                                     attention_mask_a=input_mask_a,
+                                     position_ids_a=valid_a,
+                                     input_ids_b=input_ids_b,
+                                     attention_mask_b=input_mask_b,
+                                     position_ids_b=valid_b,
+                                     mix_idxes=mixed_idxes,
+                                     mix_ratios=mix_ratio,
+                                     labels=labels)
                 self._update_loss(loss)
 
     def evaluate(self):
         y_true = []
         y_pred = []
-        for batch_data in self.mixup_iterator.get_original_data_batch(
-                self.tokenizer, beta_mix_ratio, self.label_map, self.config["train_batch_size"], mode='EVAL'):
-            input_ids, valid, labels = batch_data
+        for batch_data in self.data_processor.get_original_data_batch(
+                self.mixup_iterator,
+                self.tokenizer, self.label_map,
+                self.config["train_batch_size"], mode='EVAL'):
+            batch_data = tuple(d.to(self.device) for d in batch_data)
+            input_ids, input_mask, valid, labels = batch_data
             with torch.no_grad():
                 logits = self.model(input_ids_a=input_ids,
-                                  attention_mask_a=valid)
+                                    attention_mask_a=input_mask,
+                                    position_ids_a=valid)[0]
             logits = torch.argmax(F.log_softmax(logits, dim=2), dim=2)
             logits = logits.detach().cpu().numpy()
             labels = labels.to('cpu').numpy()
@@ -355,22 +400,26 @@ class MixupTrainer():
                 for j, m in enumerate(label):
                     if j == 0:
                         continue
-                    elif labels[i][j][-2] == 1.:
+                    elif labels[i][j][-1] == 1.:
                         y_true.append(temp_1)
                         y_pred.append(temp_2)
                         break
                     else:
-                        temp_1.append(self.label_map[self._get_label_ids(labels[i][j])])
+                        temp_1.append(
+                            self.label_id_map[self._get_label_ids(labels[i][j])])
                         try:
-                            temp_2.append(self.label_map[logits[i][j]])
+                            temp_2.append(self.label_id_map[logits[i][j]])
                         except:
                             temp_2.append('UKN')
+        return classification_report(y_true, y_pred)
+
     @classmethod
     def _get_label_ids(cls, label):
         for i, l in enumerate(label):
             if l == 1:
                 return i
         return -1
+
 
 # Abstract class with weighting / random entity
 # DEFAULT WEIGHTING SCHEMES
