@@ -22,15 +22,12 @@ an extracted feature corresponding to an input data point.
 import logging
 import torch
 import random
-from torch import nn
+from tqdm import trange
 import os
-from typing import Dict, List, Optional, Tuple, Iterator
-from collections import Counter
 import numpy as np
 import torch.nn.functional as F
 from transformers import BertTokenizer, BertConfig, BertModel, \
-    BertForTokenClassification, AdamW
-from pytorch_transformers import WarmupLinearSchedule
+    BertForTokenClassification
 from seqeval.metrics import classification_report
 
 from forte.data.data_pack import DataPack
@@ -229,14 +226,15 @@ class MixupTrainer():
             "adam_epsilon": 1e-08,
             "max_grad_norm": 1e-08,
             "device": 'cuda',
+            "num_initial": 200,
         }
 
     def get_data_iterator(self):
         root_path = os.path.abspath(
             os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
-                # os.pardir,
-                # os.pardir,
+                os.pardir,
+                os.pardir,
             )
         )
 
@@ -258,6 +256,7 @@ class MixupTrainer():
 
         self.feature_schemes = {}
 
+        num_initial = self.config["num_initial"]
         self.mixup_iterator = MixUpIterator(
             self.get_iterator(reader, train_file_path),
             data_pack_entity_weighting,
@@ -267,8 +266,10 @@ class MixupTrainer():
              "skip_k": skip_k},
             train_iterator=lambda: self.get_iterator(reader, train_file_path),
             eval_iterator=lambda: self.get_iterator(reader, eval_file_path),
-            test_iterator=lambda: self.get_iterator(reader, test_file_path)
+            test_iterator=lambda: self.get_iterator(reader, test_file_path),
+            num_initial=num_initial,
         )
+        self.train_iterator = self.get_iterator(reader, train_file_path)
         self.eval_iterator = self.get_iterator(reader, eval_file_path)
 
     @classmethod
@@ -312,12 +313,12 @@ class MixupTrainer():
                                             self.config["num_pretrain_epochs"]))
         warmup_steps = int(
             self.config["warmup_proportion"] * num_train_optimization_steps)
-        self.optimizer = AdamW(optimizer_grouped_parameters,
-                               lr=self.config["learning_rate"],
-                               eps=self.config["adam_epsilon"])
-        self.scheduler = WarmupLinearSchedule(self.optimizer,
-                                              warmup_steps=warmup_steps,
-                                              t_total=num_train_optimization_steps)
+        # self.optimizer = AdamW(optimizer_grouped_parameters,
+        #                        lr=self.config["learning_rate"],
+        #                        eps=self.config["adam_epsilon"])
+        # self.scheduler = WarmupLinearSchedule(self.optimizer,
+        #                                       warmup_steps=warmup_steps,
+        #                                       t_total=num_train_optimization_steps)
 
     def _update_loss(self, loss):
         loss.backward()
@@ -334,13 +335,13 @@ class MixupTrainer():
         pretrain_epochs = self.config["num_pretrain_epochs"]
         train_epochs = self.config["num_train_epochs"]
         for epoch in range(pretrain_epochs + train_epochs):
-            report = self.evaluate()
-            print(report)
-            self.epoch_train(pretrain=epoch < pretrain_epochs)
+            for _ in trange(5, desc='Inner Epoch'):
+                self.epoch_train(pretrain=epoch < pretrain_epochs)
             report = self.evaluate()
             print(report)
 
     def epoch_train(self, pretrain=False):
+        i = 0
         for batch_data in self.data_processor.get_original_data_batch(
                 self.mixup_iterator,
                 self.tokenizer, self.label_map,
@@ -348,13 +349,14 @@ class MixupTrainer():
                 self.config["max_len"],
         ):
             batch_data = tuple(d.to(self.device) for d in batch_data)
-            # print("b", batch_data)
             input_ids, input_mask, valid, labels = batch_data
-            loss, _ = self.model(input_ids_a=input_ids,
-                                 attention_mask_a=input_mask,
-                                 position_ids_a=valid,
-                                 labels=labels)
-            self._update_loss(loss)
+            i += 1
+            print("b", i, len(input_ids))
+            # loss, _ = self.model(input_ids_a=input_ids,
+            #                      attention_mask_a=input_mask,
+            #                      position_ids_a=valid,
+            #                      labels=labels)
+            # self._update_loss(loss)
 
         if not pretrain:
             for batch_data in self.data_processor.get_mixed_data_batch(
@@ -448,6 +450,7 @@ def train():
     trainer = MixupTrainer({
 
     })
+
     trainer.train()
 
 

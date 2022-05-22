@@ -22,6 +22,7 @@ from typing import Dict, Iterator, Type, Optional, List, Tuple, Union, Any, \
     Callable
 import copy
 import numpy as np
+import random
 
 from forte.utils.utils import get_class
 from forte.common.configurable import Configurable
@@ -135,6 +136,7 @@ class MixUpIterator(Configurable):
             train_iterator,
             eval_iterator = None,
             test_iterator = None,
+            num_initial = -1
     ):
         self.configs = self.make_configs(configs)
         self._data_request = {
@@ -148,6 +150,8 @@ class MixUpIterator(Configurable):
         elif self.configs['segment_type'] == "Sentence":
             augment_entry = "ft.onto.base_ontology.Sentence"
         self.augment_entry = get_class(augment_entry)
+        self.num_initial = num_initial
+        pack_iterator = self.random_sample(pack_iterator, num_initial)
         self._segment_pool_sampler: DataPackWeightSampler = DataPackWeightSampler(
             pack_iterator, data_pack_weighting_fn,
             self.configs["context_type"],
@@ -179,6 +183,20 @@ class MixUpIterator(Configurable):
             self.original_data_iterator = OriginalDataIterator(self.test_iterator())
         else:
             raise Exception
+        self.original_data_iterator = self.random_sample(
+            self.original_data_iterator, self.num_initial)
+
+    @classmethod
+    def random_sample(cls, sequence, size, seed=0):
+        print("RANDOM SAMPLE", size)
+        if size == -1:
+            seq = sequence
+        else:
+            random.seed(seed)
+            seq = iter(random.sample(list(sequence), size))
+        for d in seq:
+            yield d
+
 
     def _iter_mixed(self):
         return next(self.mix_up_data_iterator)
@@ -281,7 +299,7 @@ class MixupDataProcessor():
             input_ids = tokenizer.convert_tokens_to_ids(tokens)
             input_ids, input_mask = self._adjust_seq_length(input_ids, max_len, gen_mask=True)
             valid, _ = self._adjust_seq_length(valid, max_len, gen_mask=False)
-            labels, _ = self._adjust_seq_length(labels, max_len, label_map[''])
+            labels, _ = self._adjust_seq_length(labels, max_len, label_map["[NULL]"])
             labels = np.array(labels)
             if len(input_ids) != max_len:
                 print(len(input_ids))
@@ -315,11 +333,11 @@ class MixupDataProcessor():
             len_a, len_b = end_a - begin_a, end_b - begin_b
             if len_b > len_a:
                 input_ids_a, valid_a, labels_a, end_a = self._adjust_segment_length(
-                    input_ids_a, end_a, valid_a, labels_a, label_map[""],
+                    input_ids_a, end_a, valid_a, labels_a, label_map["[NULL]"],
                     len_b - len_a)
             else:
                 input_ids_b, valid_b, labels_b, end_b = self._adjust_segment_length(
-                    input_ids_b, end_b, valid_b, labels_b, label_map[""],
+                    input_ids_b, end_b, valid_b, labels_b, label_map["[NULL]"],
                     len_a - len_b)
 
             input_ids_a, input_mask_a = self._adjust_seq_length(input_ids_a, max_len, gen_mask=True)
