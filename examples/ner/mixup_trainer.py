@@ -259,33 +259,42 @@ class MixupTrainer():
 
         num_initial = self.config["num_initial"]
         self.mixup_iterator = MixUpIterator(
-            self.get_iterator(reader, train_file_path),
+            self.get_iterator(reader, train_file_path, num_initial=num_initial),
             data_pack_entity_weighting,
             data_pack_random_entity,
             {"context_type": context_type,
              # "request": request,
              "skip_k": skip_k},
-            train_iterator=lambda: self.get_iterator(reader, train_file_path),
+            train_iterator=lambda: self.get_iterator(reader, train_file_path, num_initial=num_initial),
             eval_iterator=lambda: self.get_iterator(reader, eval_file_path),
             test_iterator=lambda: self.get_iterator(reader, test_file_path),
-            num_initial=num_initial,
         )
         self.train_iterator = self.get_iterator(reader, train_file_path)
         self.eval_iterator = self.get_iterator(reader, eval_file_path)
 
     @classmethod
-    def get_iterator(cls, reader, file_path):
+    def get_iterator(cls, reader, file_path, num_initial=-1):
         pl: Pipeline = Pipeline()
         pl.set_reader(reader)
         pl.initialize()
-        return pl.process_dataset(file_path)
+        return cls.random_sample(pl.process_dataset(file_path), num_initial)
+
+    @classmethod
+    def random_sample(cls, sequence, size, seed=0):
+        if size == -1:
+            seq = sequence
+        else:
+            random.seed(seed)
+            seq = iter(random.sample(list(sequence), size))
+        for d in seq:
+            yield d
 
     def get_model(self):
-        labels = ["[NULL]", "O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG",
+        labels = ["O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG",
                   "I-ORG", "B-LOC", "I-LOC", "[CLS]", "[SEP]"]
         self.label_map = {l: one_hot_label(i, len(labels)) for i, l in
                           enumerate(labels)}
-        self.label_map['[NULL]'] = [0] * len(labels)
+        self.label_map[""] = [0] * len(labels)
         self.label_id_map = {i:l for i, l in
                           enumerate(labels)}
         bert_config = BertConfig.from_pretrained(BERT_MODEL,
@@ -341,7 +350,6 @@ class MixupTrainer():
             print(report)
 
     def epoch_train(self, pretrain=False):
-        i = 0
         for batch_data in self.data_processor.get_original_data_batch(
                 self.mixup_iterator,
                 self.tokenizer, self.label_map,
@@ -350,7 +358,6 @@ class MixupTrainer():
         ):
             batch_data = tuple(d.to(self.device) for d in batch_data)
             input_ids, input_mask, valid, labels, label_mask = batch_data
-            i += 1
             loss, _ = self.model(input_ids_a=input_ids,
                                  attention_mask_a=input_mask,
                                  position_ids_a=valid,
@@ -414,6 +421,8 @@ class MixupTrainer():
                             temp_2.append(self.label_id_map[logits[i][j]])
                         except:
                             temp_2.append('UKN')
+        print(y_true)
+        print(y_pred)
         return classification_report(y_true, y_pred)
 
     @classmethod

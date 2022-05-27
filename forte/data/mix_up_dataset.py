@@ -49,6 +49,12 @@ except ImportError as e:
         )
     ) from e
 
+def get_label_ids(label):
+    for i, l in enumerate(label):
+        if l == 1:
+            return i
+    return -1
+
 
 class Instance(object):
     def __init__(self, input_ids, input_mask, valid, labels, label_mask):
@@ -104,34 +110,6 @@ class OriginalDataIterator():
         return d
 
 
-class MixUpPairDataIterator():
-    def __init__(self, segment_pool, segment_annotate_fn, augment_entry):
-        self.segment_pool = segment_pool
-        self.segment_annotate_fn = segment_annotate_fn
-        self.augment_entry = augment_entry
-
-        self.annotated_pack_pool = []
-
-        for sentence, pack, seg_num, tag in self.segment_pool:
-            seg_tid = self.segment_annotate_fn(pack, sentence, seg_num)
-            annotated_pack = DataPack()
-            annotated_pack.set_text(sentence.text)
-            segment = pack.get_entry(seg_tid)
-            type = getattr(segment, 'ner_type')
-            start, end = segment.begin - sentence.begin, segment.end - sentence.begin
-            entry = self.augment_entry(annotated_pack, start, end)
-            setattr(entry, 'ner_type', type)
-            setattr(annotated_pack, 'tag', tag)
-            annotated_pack.add_entry(entry)
-            self.annotated_pack_pool.append(annotated_pack)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return next(self.annotated_pack_pool)
-
-
 class MixUpIterator(Configurable):
     def __init__(
             self,
@@ -142,7 +120,6 @@ class MixUpIterator(Configurable):
             train_iterator,
             eval_iterator=None,
             test_iterator=None,
-            num_initial=-1
     ):
         self.configs = self.make_configs(configs)
         self._data_request = {
@@ -156,8 +133,6 @@ class MixUpIterator(Configurable):
         elif self.configs['segment_type'] == "Sentence":
             augment_entry = "ft.onto.base_ontology.Sentence"
         self.augment_entry = get_class(augment_entry)
-        self.num_initial = num_initial
-        pack_iterator = self.random_sample(pack_iterator, num_initial)
         self._segment_pool_sampler: DataPackWeightSampler = DataPackWeightSampler(
             pack_iterator, data_pack_weighting_fn,
             self.configs["context_type"],
@@ -207,19 +182,6 @@ class MixUpIterator(Configurable):
             self.original_data_iterator = OriginalDataIterator(self.test_iterator())
         else:
             raise Exception
-        self.original_data_iterator = self.random_sample(
-            self.original_data_iterator, self.num_initial)
-
-    @classmethod
-    def random_sample(cls, sequence, size, seed=0):
-        print("RANDOM SAMPLE", size)
-        if size == -1:
-            seq = sequence
-        else:
-            random.seed(seed)
-            seq = iter(random.sample(list(sequence), size))
-        for d in seq:
-            yield d
 
     def __iter__(self):
         return self
@@ -324,7 +286,7 @@ class MixupDataProcessor():
             input_ids = tokenizer.convert_tokens_to_ids(tokens)
             input_ids, input_mask = self._adjust_seq_length(input_ids, max_len, gen_mask=True)
             valid, _ = self._adjust_seq_length(valid, max_len, gen_mask=False)
-            labels, _ = self._adjust_seq_length(labels, max_len, label_map["[NULL]"])
+            labels, _ = self._adjust_seq_length(labels, max_len, label_map[""])
             label_mask, _ = self._adjust_seq_length(label_mask, max_len)
             labels = np.array(labels)
             instances.append(Instance(input_ids, input_mask, valid, labels, label_mask))
@@ -362,11 +324,11 @@ class MixupDataProcessor():
             len_a, len_b = mix_end_a - mix_start_a, mix_end_b - mix_start_b
             if len_b > len_a:
                 input_ids_a, valid_a, labels_a, mix_end_a = self._adjust_segment_length(
-                    input_ids_a, mix_end_a, valid_a, labels_a, label_map["[NULL]"],
+                    input_ids_a, mix_end_a, valid_a, labels_a, label_map[""],
                     len_b - len_a)
             else:
                 input_ids_b, valid_b, labels_b, mix_end_b = self._adjust_segment_length(
-                    input_ids_b, mix_end_b, valid_b, labels_b, label_map["[NULL]"],
+                    input_ids_b, mix_end_b, valid_b, labels_b, label_map[""],
                     len_a - len_b)
 
             input_ids_a, input_mask_a = self._adjust_seq_length(input_ids_a, max_len, gen_mask=True)
@@ -375,7 +337,7 @@ class MixupDataProcessor():
             valid_b, _ = self._adjust_seq_length(valid_b, max_len)
 
             mix_ratio = mix_ratio_fn(8)
-            labels_a, _ = self._adjust_seq_length(labels_a, max_len, label_map["[NULL]"])
+            labels_a, _ = self._adjust_seq_length(labels_a, max_len, label_map[""])
             labels_a = np.array(labels_a)
             labels_b = np.array(labels_b)
             mixed_label = self.mix_labels(labels_a, labels_b, mix_ratio,
@@ -383,7 +345,7 @@ class MixupDataProcessor():
             instances.append(MixInstance(input_ids_a, input_ids_b,
                                          input_mask_a, input_mask_b, valid_a,
                                          valid_b, mix_ratio_fn(8), mixed_label,
-                                         (mix_start_a, mix_end_a, mix_start_b, mix_end_b)))
+                                         (mix_start_a, mix_end_a, mix_start_b, mix_end_b), label_mask_a))
             print(tags_a[begin_a-1:end_a-1], tags_b[begin_b-1:end_b-1], mixed_label[begin_a:end_a])
 
             if len(instances) == batch_size:
