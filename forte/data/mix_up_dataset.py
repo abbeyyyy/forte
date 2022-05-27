@@ -51,17 +51,17 @@ except ImportError as e:
 
 
 class Instance(object):
-    def __init__(self, input_ids, input_mask, valid, labels):
+    def __init__(self, input_ids, input_mask, valid, labels, label_mask):
         self.input_ids = input_ids
         self.input_mask = input_mask
         self.valid = valid
         self.labels = labels
+        self.label_mask = label_mask
 
 
 class MixInstance(object):
     def __init__(self, input_ids_a, input_ids_b, input_mask_a, input_mask_b,
-                 valid_a, valid_b,
-                 mix_ratio, labels, mix_idx):
+                 valid_a, valid_b, mix_ratio, labels, mix_idx, label_mask):
         self.input_ids_a = input_ids_a
         self.input_ids_b = input_ids_b
         self.input_mask_a = input_mask_a
@@ -71,6 +71,7 @@ class MixInstance(object):
         self.mix_ratio = mix_ratio
         self.labels = labels
         self.mix_idx = mix_idx
+        self.label_mask = label_mask
 
 
 class OriginalDataIterator():
@@ -102,16 +103,15 @@ class OriginalDataIterator():
         setattr(d, 'tag', tag)
         return d
 
+
 class MixUpPairDataIterator():
     def __init__(self, segment_pool, segment_annotate_fn, augment_entry):
         self.segment_pool = segment_pool
         self.segment_annotate_fn = segment_annotate_fn
         self.augment_entry = augment_entry
 
-    def __iter__(self):
-        return self
+        self.annotated_pack_pool = []
 
-    def __next__(self):
         for sentence, pack, seg_num, tag in self.segment_pool:
             seg_tid = self.segment_annotate_fn(pack, sentence, seg_num)
             annotated_pack = DataPack()
@@ -123,7 +123,13 @@ class MixUpPairDataIterator():
             setattr(entry, 'ner_type', type)
             setattr(annotated_pack, 'tag', tag)
             annotated_pack.add_entry(entry)
-            return annotated_pack
+            self.annotated_pack_pool.append(annotated_pack)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.annotated_pack_pool)
 
 
 class MixUpIterator(Configurable):
@@ -134,9 +140,9 @@ class MixUpIterator(Configurable):
             segment_annotate_fn: Callable[[DataPack, Sentence, int], int],
             configs: Union[Config, Dict[str, Any]],
             train_iterator,
-            eval_iterator = None,
-            test_iterator = None,
-            num_initial = -1
+            eval_iterator=None,
+            test_iterator=None,
+            num_initial=-1
     ):
         self.configs = self.make_configs(configs)
         self._data_request = {
@@ -159,6 +165,7 @@ class MixUpIterator(Configurable):
         )
         self.segment_pool = self._segment_pool_sampler.generate_weighted_samples(
             self.configs['augment_size'])
+        print([sentence.text for sentence, pack, seg_num, tag in self.segment_pool])
         self.segment_annotate_fn = segment_annotate_fn
         self.train_iterator = train_iterator
         self.eval_iterator = eval_iterator
@@ -167,10 +174,27 @@ class MixUpIterator(Configurable):
         self.iter_mode_mixed = False
         self.train_mode = 'TRAIN'
 
-        self.mix_up_data_iterator = MixUpPairDataIterator(self.segment_pool,
-                                                          self.segment_annotate_fn,
-                                                          self.augment_entry)
+        self.mix_up_data_iterator = self.convert_segment_pool_to_pair_iterator()
         self.original_data_iterator = OriginalDataIterator(self.train_iterator())
+
+    def convert_segment_pool_to_pair_iterator(self):
+
+        self._annotated_pack_pool = []
+
+        for sentence, pack, seg_num, tag in self.segment_pool:
+            seg_tid = self.segment_annotate_fn(pack, sentence, seg_num)
+            annotated_pack = DataPack()
+            annotated_pack.set_text(sentence.text)
+            segment = pack.get_entry(seg_tid)
+            type = getattr(segment, 'ner_type')
+            start, end = segment.begin - sentence.begin, segment.end - sentence.begin
+            entry = self.augment_entry(annotated_pack, start, end)
+            setattr(entry, 'ner_type', type)
+            setattr(annotated_pack, 'tag', tag)
+            annotated_pack.add_entry(entry)
+            self._annotated_pack_pool.append(annotated_pack)
+
+        return iter(self._annotated_pack_pool)
 
     def switch_original_dataset(self, train_mode):
         self.train_mode = train_mode
@@ -197,18 +221,14 @@ class MixUpIterator(Configurable):
         for d in seq:
             yield d
 
-
-    def _iter_mixed(self):
-        return next(self.mix_up_data_iterator)
-
     def __iter__(self):
         return self
 
     def __next__(self):
         if self.iter_mode_mixed:
             try:
-                data_a = self._iter_mixed()
-                data_b = self._iter_mixed()
+                data_a = next(self.mix_up_data_iterator)
+                data_b = next(self.mix_up_data_iterator)
             except StopIteration as e:
                 raise StopIteration from e
             return data_a, data_b
@@ -235,33 +255,38 @@ class MixupDataProcessor():
         labels = []
         valid = []
         label_mask = []
-        mix_start, mix_end, word_len, token_len = 0, 0, 0, 0
+        mix_start, mix_end, lab_mix_start, lab_mix_end, word_len, token_len, lab_len = 0, 0, 0, 0, 0, 0, 0
         tokens.append('[CLS]')
         valid.append(1)
         label_mask.append(1)
         labels.append(label_map['[CLS]'])
+        token_len += 1
+        lab_len += 1
         for i, word in enumerate(text_list):
             token = tokenizer.tokenize(word)
             tokens.extend(token)
-            for idx in range(len(token)):
-                labels.append(label_map[tags[i]])
-                label_mask.append(1)
-                if idx == 0:
-                    valid.append(1)
-                else:
-                    valid.append(0)
             # print(word_len, begin, end)
             if word_len == begin:
                 mix_start = token_len
-            word_len += len(word) + 1
-            token_len += len(token)
+                lab_mix_start = lab_len
             if word_len == end + 1:
                 mix_end = token_len
+                lab_mix_end = lab_len
+            word_len += len(word) + 1
+            token_len += len(token)
+            for idx in range(len(token)):
+                if idx == 0:
+                    labels.append(label_map[tags[i]])
+                    label_mask.append(1)
+                    valid.append(1)
+                    lab_len += 1
+                else:
+                    valid.append(0)
         tokens.append('[SEP]')
         valid.append(1)
         label_mask.append(1)
         labels.append(label_map['[SEP]'])
-        return tokens, valid, labels, label_mask, mix_start, mix_end
+        return tokens, valid, labels, label_mask, mix_start, mix_end, lab_mix_start, lab_mix_end
 
     def _adjust_segment_length(self, input_ids, mix_end, valid,
                                labels, label_padding, adjust_len):
@@ -283,9 +308,9 @@ class MixupDataProcessor():
                 mask += [0] * (max_len - len(sequence))
             sequence += [padding] * (max_len - len(sequence))
 
-        assert(len(sequence) == max_len)
+        assert (len(sequence) == max_len)
         if gen_mask:
-            assert(len(mask) == max_len)
+            assert (len(mask) == max_len)
         return sequence, mask
 
     def get_original_data_batch(self, iterator: MixUpIterator, tokenizer, label_map, batch_size=1,
@@ -294,16 +319,15 @@ class MixupDataProcessor():
         iterator.iter_mode_mixed = False
         iterator.switch_original_dataset(mode)
         for d in iterator:
-            tokens, valid, labels, label_mask, _, _ = self._tokenize_sentence(
+            tokens, valid, labels, label_mask, _, _, _, _ = self._tokenize_sentence(
                 tokenizer, label_map, d, d.tag)
             input_ids = tokenizer.convert_tokens_to_ids(tokens)
             input_ids, input_mask = self._adjust_seq_length(input_ids, max_len, gen_mask=True)
             valid, _ = self._adjust_seq_length(valid, max_len, gen_mask=False)
             labels, _ = self._adjust_seq_length(labels, max_len, label_map["[NULL]"])
+            label_mask, _ = self._adjust_seq_length(label_mask, max_len)
             labels = np.array(labels)
-            if len(input_ids) != max_len:
-                print(len(input_ids))
-            instances.append(Instance(input_ids, input_mask, valid, labels))
+            instances.append(Instance(input_ids, input_mask, valid, labels, label_mask))
             if len(instances) == batch_size:
                 yield self._batch_fn(instances)
                 instances = []
@@ -315,46 +339,53 @@ class MixupDataProcessor():
         begin_a, end_a, begin_b, end_b = 0, 0, 0, 0
         iterator.iter_mode_mixed = True
         for d_a, d_b in iterator:
+            # print(d_a.text, d_b.text)
             for augment_entry in d_a.get(iterator.augment_entry):
                 begin_a, end_a = augment_entry.begin, augment_entry.end
                 tags_a = d_a.tag
-            tokens_a, valid_a, labels_a, label_mask_a, mix_start_a, mix_end_a = self._tokenize_sentence(
+            tokens_a, valid_a, labels_a, label_mask_a, mix_start_a, mix_end_a, begin_a, end_a = self._tokenize_sentence(
                 tokenizer, label_map, d_a, tags_a, begin_a, end_a)
+            tag_a = tags_a[begin_a-1][2:]
 
             for augment_entry in d_b.get(iterator.augment_entry):
                 begin_b, end_b = augment_entry.begin, augment_entry.end
                 tags_b = d_b.tag
-            tokens_b, valid_b, labels_b, label_mask_b, mix_start_b, mix_end_b = self._tokenize_sentence(
+            tokens_b, valid_b, labels_b, label_mask_b, mix_start_b, mix_end_b, begin_b, end_b = self._tokenize_sentence(
                 tokenizer, label_map, d_b, tags_b, begin_b, end_b)
+            print(begin_b, end_b)
+            print(tags_b)
+            tag_b = tags_b[begin_b-1][2:]
 
             input_ids_a = tokenizer.convert_tokens_to_ids(tokens_a)
             input_ids_b = tokenizer.convert_tokens_to_ids(tokens_b)
 
-            len_a, len_b = end_a - begin_a, end_b - begin_b
+            len_a, len_b = mix_end_a - mix_start_a, mix_end_b - mix_start_b
             if len_b > len_a:
-                input_ids_a, valid_a, labels_a, end_a = self._adjust_segment_length(
-                    input_ids_a, end_a, valid_a, labels_a, label_map["[NULL]"],
+                input_ids_a, valid_a, labels_a, mix_end_a = self._adjust_segment_length(
+                    input_ids_a, mix_end_a, valid_a, labels_a, label_map["[NULL]"],
                     len_b - len_a)
             else:
-                input_ids_b, valid_b, labels_b, end_b = self._adjust_segment_length(
-                    input_ids_b, end_b, valid_b, labels_b, label_map["[NULL]"],
+                input_ids_b, valid_b, labels_b, mix_end_b = self._adjust_segment_length(
+                    input_ids_b, mix_end_b, valid_b, labels_b, label_map["[NULL]"],
                     len_a - len_b)
 
             input_ids_a, input_mask_a = self._adjust_seq_length(input_ids_a, max_len, gen_mask=True)
             input_ids_b, input_mask_b = self._adjust_seq_length(input_ids_b, max_len, gen_mask=True)
             valid_a, _ = self._adjust_seq_length(valid_a, max_len)
             valid_b, _ = self._adjust_seq_length(valid_b, max_len)
-            labels_a, _ = self._adjust_seq_length(labels_a, max_len, label_map[''])
-            labels_b, _ = self._adjust_seq_length(labels_b, max_len, label_map[''])
 
             mix_ratio = mix_ratio_fn(8)
-            mixed_label = self.mix_sequence(labels_a, labels_b, mix_ratio,
-                                            (begin_a, end_a, begin_b, end_b))
-            mixed_label = np.array(mixed_label)
+            labels_a, _ = self._adjust_seq_length(labels_a, max_len, label_map["[NULL]"])
+            labels_a = np.array(labels_a)
+            labels_b = np.array(labels_b)
+            mixed_label = self.mix_labels(labels_a, labels_b, mix_ratio,
+                                          (begin_a, end_a, begin_b, end_b), tag_b, label_map)
             instances.append(MixInstance(input_ids_a, input_ids_b,
                                          input_mask_a, input_mask_b, valid_a,
                                          valid_b, mix_ratio_fn(8), mixed_label,
-                                         (begin_a, end_a, begin_b, end_b)))
+                                         (mix_start_a, mix_end_a, mix_start_b, mix_end_b)))
+            print(tags_a[begin_a-1:end_a-1], tags_b[begin_b-1:end_b-1], mixed_label[begin_a:end_a])
+
             if len(instances) == batch_size:
                 yield self._mixed_batch_fn(instances)
                 instances = []
@@ -369,7 +400,9 @@ class MixupDataProcessor():
                                    dtype=torch.long)
         label_batch = torch.tensor([ins.labels for ins in instances],
                                    dtype=torch.float)
-        return input_ids_batch, input_mask_batch, valid_batch, label_batch
+        label_mask_batch = torch.tensor([ins.label_mask for ins in instances],
+                                        dtype=torch.long)
+        return input_ids_batch, input_mask_batch, valid_batch, label_batch, label_mask_batch
 
     @classmethod
     def _mixed_batch_fn(cls, instances: List[MixInstance]):
@@ -391,19 +424,26 @@ class MixupDataProcessor():
                                    dtype=torch.float)
         mixed_idxes = torch.tensor([ins.mix_idx for ins in instances],
                                    dtype=torch.long)
-        return input_ids_a_batch, input_ids_b_batch, input_mask_a_batch, input_mask_b_batch, valid_a_batch, valid_b_batch, mix_ratio_batch, label_batch, mixed_idxes
+        label_mask_batch = torch.tensor([ins.label_mask for ins in instances],
+                                   dtype=torch.long)
+        return input_ids_a_batch, input_ids_b_batch, input_mask_a_batch, input_mask_b_batch, valid_a_batch, \
+               valid_b_batch, mix_ratio_batch, label_batch, label_mask_batch, mixed_idxes
 
     @classmethod
-    def mix_sequence(cls, seq_a, seq_b, mix_ratio, mix_idx):
+    def mix_labels(cls, lab_a, lab_b, mix_ratio, mix_idx, tag_b, label_map):
         begin_a, end_a, begin_b, end_b = mix_idx
-        assert (end_a - begin_a == end_b - begin_b)
-        mixed_seq = seq_a.copy()
+        mixed_seq = lab_a.copy()
+        padding = np.array(label_map['I-' + tag_b])
         for idx in range(end_a - begin_a):
             idx_a = idx + begin_a
             idx_b = idx + begin_b
-            if idx_a < len(seq_a) and idx_b < len(seq_b):
-                mixed_seq[idx_a] = seq_a[idx_a] * mix_ratio + \
-                                   seq_b[idx_b] * (1 - mix_ratio)
+            if idx_a < len(lab_a):
+                if idx_b < len(lab_b):
+                    mixed_seq[idx_a] = lab_a[idx_a] * mix_ratio + \
+                                       lab_b[idx_b] * (1 - mix_ratio)
+                else:
+                    mixed_seq[idx_a] = lab_a[idx_a] * mix_ratio + \
+                                       padding * (1 - mix_ratio)
         return mixed_seq
 
     @classmethod

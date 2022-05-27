@@ -27,7 +27,8 @@ import os
 import numpy as np
 import torch.nn.functional as F
 from transformers import BertTokenizer, BertConfig, BertModel, \
-    BertForTokenClassification
+    BertForTokenClassification, AdamW
+from pytorch_transformers import WarmupLinearSchedule
 from seqeval.metrics import classification_report
 
 from forte.data.data_pack import DataPack
@@ -143,7 +144,7 @@ class BertForNer(BertForTokenClassification):
         outputs = self.bert(input_ids_a=input_ids_a, token_type_ids_a=None,
                             attention_mask_a=attention_mask_a,
                             position_ids_a=position_ids_a,
-                            head_mask_a=head_mask_a,
+                            head_mask_a=None,
                             input_ids_b=input_ids_b,
                             token_type_ids_b=token_type_ids_b,
                             attention_mask_b=attention_mask_b,
@@ -281,10 +282,10 @@ class MixupTrainer():
 
     def get_model(self):
         labels = ["[NULL]", "O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG",
-                  "I-ORG",
-                  "B-LOC", "I-LOC", "[CLS]", "[SEP]"]
+                  "I-ORG", "B-LOC", "I-LOC", "[CLS]", "[SEP]"]
         self.label_map = {l: one_hot_label(i, len(labels)) for i, l in
                           enumerate(labels)}
+        self.label_map['[NULL]'] = [0] * len(labels)
         self.label_id_map = {i:l for i, l in
                           enumerate(labels)}
         bert_config = BertConfig.from_pretrained(BERT_MODEL,
@@ -313,12 +314,12 @@ class MixupTrainer():
                                             self.config["num_pretrain_epochs"]))
         warmup_steps = int(
             self.config["warmup_proportion"] * num_train_optimization_steps)
-        # self.optimizer = AdamW(optimizer_grouped_parameters,
-        #                        lr=self.config["learning_rate"],
-        #                        eps=self.config["adam_epsilon"])
-        # self.scheduler = WarmupLinearSchedule(self.optimizer,
-        #                                       warmup_steps=warmup_steps,
-        #                                       t_total=num_train_optimization_steps)
+        self.optimizer = AdamW(optimizer_grouped_parameters,
+                               lr=self.config["learning_rate"],
+                               eps=self.config["adam_epsilon"])
+        self.scheduler = WarmupLinearSchedule(self.optimizer,
+                                              warmup_steps=warmup_steps,
+                                              t_total=num_train_optimization_steps)
 
     def _update_loss(self, loss):
         loss.backward()
@@ -335,8 +336,7 @@ class MixupTrainer():
         pretrain_epochs = self.config["num_pretrain_epochs"]
         train_epochs = self.config["num_train_epochs"]
         for epoch in range(pretrain_epochs + train_epochs):
-            for _ in trange(5, desc='Inner Epoch'):
-                self.epoch_train(pretrain=epoch < pretrain_epochs)
+            self.epoch_train(pretrain=epoch < pretrain_epochs)
             report = self.evaluate()
             print(report)
 
@@ -349,14 +349,14 @@ class MixupTrainer():
                 self.config["max_len"],
         ):
             batch_data = tuple(d.to(self.device) for d in batch_data)
-            input_ids, input_mask, valid, labels = batch_data
+            input_ids, input_mask, valid, labels, label_mask = batch_data
             i += 1
-            print("b", i, len(input_ids))
-            # loss, _ = self.model(input_ids_a=input_ids,
-            #                      attention_mask_a=input_mask,
-            #                      position_ids_a=valid,
-            #                      labels=labels)
-            # self._update_loss(loss)
+            loss, _ = self.model(input_ids_a=input_ids,
+                                 attention_mask_a=input_mask,
+                                 position_ids_a=valid,
+                                 head_mask_a=label_mask,
+                                 labels=labels)
+            self._update_loss(loss)
 
         if not pretrain:
             for batch_data in self.data_processor.get_mixed_data_batch(
@@ -367,10 +367,11 @@ class MixupTrainer():
             ):
                 # print("b", batch_data)
                 batch_data = tuple(d.to(self.device) for d in batch_data)
-                input_ids_a, input_ids_b, input_mask_a, input_mask_b, valid_a, valid_b, mix_ratio, labels, mixed_idxes = batch_data
+                input_ids_a, input_ids_b, input_mask_a, input_mask_b, valid_a, valid_b, mix_ratio, labels, mixed_idxes, label_mask = batch_data
                 loss, _ = self.model(input_ids_a=input_ids_a,
                                      attention_mask_a=input_mask_a,
                                      position_ids_a=valid_a,
+                                     head_mask_a=label_mask,
                                      input_ids_b=input_ids_b,
                                      attention_mask_b=input_mask_b,
                                      position_ids_b=valid_b,
@@ -387,7 +388,7 @@ class MixupTrainer():
                 self.tokenizer, self.label_map,
                 self.config["train_batch_size"], mode='EVAL'):
             batch_data = tuple(d.to(self.device) for d in batch_data)
-            input_ids, input_mask, valid, labels = batch_data
+            input_ids, input_mask, valid, labels, label_mask = batch_data
             with torch.no_grad():
                 logits = self.model(input_ids_a=input_ids,
                                     attention_mask_a=input_mask,
