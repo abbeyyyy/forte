@@ -269,8 +269,6 @@ class MixupTrainer():
             eval_iterator=lambda: self.get_iterator(reader, eval_file_path),
             test_iterator=lambda: self.get_iterator(reader, test_file_path),
         )
-        self.train_iterator = self.get_iterator(reader, train_file_path)
-        self.eval_iterator = self.get_iterator(reader, eval_file_path)
 
     @classmethod
     def get_iterator(cls, reader, file_path, num_initial=-1):
@@ -295,8 +293,8 @@ class MixupTrainer():
         self.label_map = {l: one_hot_label(i, len(labels)) for i, l in
                           enumerate(labels)}
         self.label_map[""] = [0] * len(labels)
-        self.label_id_map = {i:l for i, l in
-                          enumerate(labels)}
+        self.label_id_map = {i: l for i, l in
+                             enumerate(labels)}
         bert_config = BertConfig.from_pretrained(BERT_MODEL,
                                                  num_labels=len(labels),
                                                  finetuning_task=TASK_NAME)
@@ -399,7 +397,8 @@ class MixupTrainer():
             with torch.no_grad():
                 logits = self.model(input_ids_a=input_ids,
                                     attention_mask_a=input_mask,
-                                    position_ids_a=valid)[0]
+                                    position_ids_a=valid,
+                                    head_mask_a=label_mask)[0]
             logits = torch.argmax(F.log_softmax(logits, dim=2), dim=2)
             logits = logits.detach().cpu().numpy()
             labels = labels.to('cpu').numpy()

@@ -111,14 +111,17 @@ class OriginalDataIterator():
 
 
 class MixUpIterator(Configurable):
+    """
+
+    """
     def __init__(
             self,
-            pack_iterator: Iterator[DataPack],
-            data_pack_weighting_fn: Callable[[DataPack, Sentence], float],
-            segment_annotate_fn: Callable[[DataPack, Sentence, int], int],
+            pack_iterator: Iterator[DataPack], # data iterator to construct the segment pool
+            data_pack_weighting_fn: Callable[[DataPack, Sentence], float], # weighting function for sampling
+            segment_annotate_fn: Callable[[DataPack, Sentence, int], int], # function to pick a segment from a sampled instance
             configs: Union[Config, Dict[str, Any]],
-            train_iterator,
-            eval_iterator=None,
+            train_iterator, # training data iterator
+            eval_iterator=None, # eval data iterator
             test_iterator=None,
     ):
         self.configs = self.make_configs(configs)
